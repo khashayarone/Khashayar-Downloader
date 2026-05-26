@@ -43,34 +43,22 @@ jobs:
       actions: read
 
     steps:
-      # ═══════════════════════════════════════
-      # STEP 1: Checkout Repository
-      # ═══════════════════════════════════════
       - name: "📥 Checkout Repository"
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 1
 
-      # ═══════════════════════════════════════
-      # STEP 2: Configure Git
-      # ═══════════════════════════════════════
       - name: "⚙️ Configure Git"
         run: |
-          set -e
           git config --global http.postBuffer 524288000
           git config --global http.maxRequestBuffer 100M
           git config --global core.compression 0
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      # ═══════════════════════════════════════
-      # STEP 3: Setup Cloudflare WARP
-      # ═══════════════════════════════════════
       - name: "🌐 Setup Cloudflare WARP"
         run: |
-          set -e
-          echo "🔧 Creating WARP network and container..."
           docker network create warp-net 2>/dev/null || true
           docker run -d --name warp --restart=no --network warp-net \
             -p 1080:1080 --cap-add NET_ADMIN \
@@ -79,40 +67,22 @@ jobs:
             -v warp-data:/var/lib/cloudflare-warp \
             caomingjun/warp:latest
           echo "⏳ Waiting for WARP to be ready..."
-          sleep 15
-          for i in $(seq 1 5); do
-            RESULT=$(curl -s --max-time 5 --socks5-hostname 127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace 2>/dev/null || echo "failed")
-            if echo "$RESULT" | grep -qE "warp=(on|plus)"; then
-              echo "✅ WARP active!"
+          for i in {1..10}; do
+            if curl -s --max-time 5 --socks5-hostname 127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace | grep -qE "warp=(on|plus)"; then
+              echo "✅ WARP active"
               break
-            else
-              echo "⚠️ WARP not ready yet, retry $i/5..."
-              sleep 5
             fi
+            sleep 5
           done
 
-      # ═══════════════════════════════════════
-      # STEP 4: Install Dependencies
-      # ═══════════════════════════════════════
       - name: "📦 Install Dependencies"
         run: |
-          set -e
-          echo "📦 Installing system dependencies..."
           sudo apt-get update -qq
           sudo apt-get install -y -qq python3-pip ffmpeg curl jq bc rar
-          echo "📦 Installing Deno..."
           curl -fsSL https://deno.land/install.sh | sh
-          export DENO_INSTALL="$HOME/.deno"
-          export PATH="$DENO_INSTALL/bin:$PATH"
-          echo "$DENO_INSTALL/bin" >> $GITHUB_PATH
-          echo "📦 Installing Python packages..."
-          pip3 install --upgrade "yt-dlp[default,curl-cffi]" --quiet
-          pip3 install --upgrade "faster-whisper" --quiet
-          echo "✅ Dependencies installed."
+          echo "$HOME/.deno/bin" >> $GITHUB_PATH
+          pip3 install --quiet --upgrade "yt-dlp[default,curl-cffi]" "faster-whisper"
 
-      # ═══════════════════════════════════════
-      # STEP 5: Setup Parameters
-      # ═══════════════════════════════════════
       - name: "🔧 Setup Parameters"
         id: setup
         env:
@@ -120,36 +90,18 @@ jobs:
           INPUT_QUALITY: ${{ github.event.inputs.quality }}
           INPUT_MEDIA_TYPE: ${{ github.event.inputs.media_type }}
         run: |
-          set -e
           URL="${INPUT_URL}"
           QUALITY="${INPUT_QUALITY}"
           MEDIA_TYPE="${INPUT_MEDIA_TYPE}"
 
-          echo "════════════════════════════════════════"
-          echo "  $PROJECT_NAME | $PROJECT_URL"
-          echo "════════════════════════════════════════"
-          echo "🌐 Raw URL: ${URL}"
-          echo "📊 Quality: ${QUALITY}"
-          echo "🎧 Media Type: ${MEDIA_TYPE}"
-
-          # Basic normalization for known shorteners only
+          # Normalize URLs
           if [[ "$URL" =~ youtube\.com/shorts/([a-zA-Z0-9_-]{11}) ]]; then
-            URL="https://www.youtube.com/watch?v=${BASH_REMATCH[1]%%\?*}"
+            URL="https://www.youtube.com/watch?v=${BASH_REMATCH[1]}"
           elif [[ "$URL" =~ youtu\.be/([a-zA-Z0-9_-]{11}) ]]; then
-            URL="https://www.youtube.com/watch?v=${BASH_REMATCH[1]%%\?*}"
+            URL="https://www.youtube.com/watch?v=${BASH_REMATCH[1]}"
           elif [[ "$URL" =~ x\.com/ ]]; then
             URL="${URL/x.com/twitter.com}"
           fi
-
-          echo "🌐 After normalization: ${URL}"
-
-          echo "NORMALIZED_URL=${URL}" >> $GITHUB_ENV
-          echo "QUALITY=${QUALITY}" >> $GITHUB_ENV
-          echo "MEDIA_TYPE=${MEDIA_TYPE}" >> $GITHUB_ENV
-          echo "TMP_DIR=/tmp/dl_$$" >> $GITHUB_ENV
-          echo "REPO_DIR=${GITHUB_WORKSPACE}/downloads" >> $GITHUB_ENV
-          mkdir -p /tmp/dl_$$
-          mkdir -p "${GITHUB_WORKSPACE}/downloads"
 
           case "${QUALITY}" in
             audio) FORMAT="bestaudio/bestaudio*/best" ;;
@@ -157,32 +109,29 @@ jobs:
             480)   FORMAT="bestvideo[height<=480]+bestaudio/bestvideo[height<=480]*+bestaudio*/best" ;;
             *)     FORMAT="bestvideo+bestaudio/bestvideo*+bestaudio*/best" ;;
           esac
-          echo "FORMAT=${FORMAT}" >> $GITHUB_ENV
-          echo "✅ Setup complete"
 
-      # ═══════════════════════════════════════
-      # STEP 6: Download, Split & Transcript
-      # ═══════════════════════════════════════
-      - name: "🌐 Download, Split & (Optional) Transcript"
+          # Save outputs for next steps
+          echo "normalized_url=${URL}" >> $GITHUB_OUTPUT
+          echo "quality=${QUALITY}" >> $GITHUB_OUTPUT
+          echo "media_type=${MEDIA_TYPE}" >> $GITHUB_OUTPUT
+          echo "format=${FORMAT}" >> $GITHUB_OUTPUT
+          echo "tmp_dir=/tmp/dl_$(date +%s)_${RANDOM}" >> $GITHUB_OUTPUT
+
+      - name: "🌐 Download, Split & Transcript"
         id: download
         env:
-          URL: ${{ env.NORMALIZED_URL }}
-          FORMAT: ${{ env.FORMAT }}
-          QUALITY: ${{ env.QUALITY }}
-          MEDIA_TYPE: ${{ env.MEDIA_TYPE }}
-          TMP_DIR: ${{ env.TMP_DIR }}
-          TARGET_SIZE_MB: ${{ env.TARGET_SIZE_MB }}
+          URL: ${{ steps.setup.outputs.normalized_url }}
+          FORMAT: ${{ steps.setup.outputs.format }}
+          QUALITY: ${{ steps.setup.outputs.quality }}
+          MEDIA_TYPE: ${{ steps.setup.outputs.media_type }}
+          TMP_DIR: ${{ steps.setup.outputs.tmp_dir }}
           TARGET_SIZE_BYTES: ${{ env.TARGET_SIZE_BYTES }}
+          TARGET_SIZE_MB: ${{ env.TARGET_SIZE_MB }}
           MAX_PARTS: ${{ env.MAX_PARTS }}
         run: |
           set -euo pipefail
 
-          TARGET_SIZE_BYTES=${TARGET_SIZE_BYTES:-41943040}
-          TARGET_SIZE_MB=${TARGET_SIZE_MB:-40}
-          MAX_PARTS=${MAX_PARTS:-30}
-          GITHUB_WORKSPACE="${GITHUB_WORKSPACE}"
-          REPO_DOWNLOADS="${GITHUB_WORKSPACE}/downloads"
-
+          # Helper function to sanitize filenames
           sanitize_name() {
             local name="$1"
             name=$(echo "$name" | sed 's/[()（）]/_/g' | sed 's/[][{}\\/\\<>|:;'"'"'"]/_/g')
@@ -191,166 +140,86 @@ jobs:
             echo "$name"
           }
 
-          URL="${URL}"
-          TMP_DIR="tmp_dl_$$"
-          mkdir -p "$TMP_DIR"
+          mkdir -p "$TMP_DIR" "${GITHUB_WORKSPACE}/downloads"
 
-          echo "🌐 Original URL: $URL"
-
-          # ═══ SMART URL EXPANSION ═══
-          echo "🔁 Expanding URL (following redirects, max 10)..."
+          # Expand URL
+          echo "🌐 Resolving URL..."
           EXPANDED_URL=$(curl -Ls -o /dev/null -w '%{url_effective}' --max-redirs 10 --connect-timeout 10 "$URL" || echo "$URL")
-
-          # Check if expansion returned site root (path = "/" or empty)
-          EXP_PATH="/"
-          if [ -n "$EXPANDED_URL" ]; then
-            EXP_PATH=$(echo "$EXPANDED_URL" | sed -E 's|^https?://[^/]+||' | sed -E 's|\?.*$||')
-            [ -z "$EXP_PATH" ] && EXP_PATH="/"
-          fi
-
-          if [ "$EXP_PATH" = "/" ]; then
-            echo "⚠️ Expansion returned site root — keeping original URL."
-          else
+          if [[ "$EXPANDED_URL" != */ ]]; then
             URL="$EXPANDED_URL"
           fi
-          echo "🌐 Final resolved URL: $URL"
+          echo "🌐 Final URL: $URL"
 
-          # ═══ DETECT PLATFORM ═══
+          # Detect platform
           IS_YOUTUBE=false
-          if [[ "$URL" =~ youtube\.com|youtu\.be|music\.youtube\.com|youtube-nocookie\.com ]]; then
+          if [[ "$URL" =~ youtube\.com|youtu\.be|music\.youtube\.com ]]; then
             IS_YOUTUBE=true
           fi
-          echo "🔎 IS_YOUTUBE=${IS_YOUTUBE}"
 
-          # ═══ FETCH METADATA ═══
-          echo "🔍 Fetching metadata via yt-dlp..."
-          LOGS_DIR_TMP="${TMP_DIR}/logs"
-          mkdir -p "${LOGS_DIR_TMP}"
-          META_LOG="${LOGS_DIR_TMP}/meta_error.log"
-          INFO_JSON=$(yt-dlp --proxy "socks5://127.0.0.1:1080" --dump-json --skip-download "$URL" 2>"${META_LOG}" || echo "{}")
-
-          if [ ! -s "${META_LOG}" ]; then
-            echo "ℹ️ Metadata fetched successfully."
-          else
-            echo "⚠️ Metadata fetch had warnings:"
-            head -200 "${META_LOG}" || true
-          fi
-
-          CREATOR=$(echo "$INFO_JSON" | jq -r '.uploader // .channel // .creator // .artist // "Unknown"' || echo "Unknown")
-          TITLE=$(echo "$INFO_JSON" | jq -r '.title // .description // "Untitled"' || echo "Untitled")
-          EXTRACTOR=$(echo "$INFO_JSON" | jq -r '.extractor_key // "generic"' || echo "generic")
-          DURATION=$(echo "$INFO_JSON" | jq -r '.duration // 0' || echo 0)
-          VIEW_COUNT=$(echo "$INFO_JSON" | jq -r '.view_count // .play_count // 0' || echo 0)
-          THUMBNAIL_URL=$(echo "$INFO_JSON" | jq -r '.thumbnail // ""' || echo "")
-
-          echo "  🏷 Extractor: $EXTRACTOR"
-          echo "  👤 Creator:   $CREATOR"
-          echo "  📝 Title:     $TITLE"
-          echo "  ⏱ Duration:  $DURATION"
-          echo "  👁 Views:     $VIEW_COUNT"
+          # Fetch metadata
+          echo "🔍 Fetching metadata..."
+          INFO_JSON=$(yt-dlp --proxy "socks5://127.0.0.1:1080" --dump-json --skip-download "$URL" 2>/dev/null || echo "{}")
+          CREATOR=$(echo "$INFO_JSON" | jq -r '.uploader // .channel // .creator // .artist // "Unknown"')
+          TITLE=$(echo "$INFO_JSON" | jq -r '.title // .description // "Untitled"')
+          EXTRACTOR=$(echo "$INFO_JSON" | jq -r '.extractor_key // "generic"')
+          DURATION=$(echo "$INFO_JSON" | jq -r '.duration // 0')
+          VIEW_COUNT=$(echo "$INFO_JSON" | jq -r '.view_count // 0')
+          THUMBNAIL_URL=$(echo "$INFO_JSON" | jq -r '.thumbnail // ""')
 
           EXTRACTOR_SLUG=$(sanitize_name "$EXTRACTOR")
-          SAVE_DIR="${REPO_DOWNLOADS}/${EXTRACTOR_SLUG}"
-          mkdir -p "$SAVE_DIR"
-          mkdir -p "${SAVE_DIR}/logs"
-          echo "  📂 Repo dir: downloads/${EXTRACTOR_SLUG}/"
+          SAVE_DIR="${GITHUB_WORKSPACE}/downloads/${EXTRACTOR_SLUG}"
+          mkdir -p "$SAVE_DIR" "${SAVE_DIR}/logs"
 
-          # ═══ DOWNLOAD ═══
-          DOWNLOAD_SUCCESS=false
+          # Build yt-dlp options
+          YTDLP_OPTS=(
+            "--format" "$FORMAT"
+            "--no-cache-dir"
+            "--no-part"
+            "--retries" "30"
+            "--fragment-retries" "30"
+            "--socket-timeout" "60"
+            "--concurrent-fragments" "8"
+            "--merge-output-format" "mp4"
+            "--output" "${TMP_DIR}/%(title)s.%(ext)s"
+            "--impersonate" "chrome"
+            "--no-check-certificates"
+          )
 
-          build_opts() {
-            local use_proxy="$1"
-            local -a opts
-            opts=(
-              "--format" "$FORMAT"
-              "--no-cache-dir"
-              "--no-part"
-              "--retries" "30"
-              "--fragment-retries" "30"
-              "--socket-timeout" "60"
-              "--concurrent-fragments" "8"
-              "--buffer-size" "32K"
-              "--http-chunk-size" "20M"
-              "--merge-output-format" "mp4"
-              "--output" "${TMP_DIR}/%(title)s.%(ext)s"
-              "--impersonate" "chrome"
-              "--remote-components" "ejs:github"
-              "--no-check-certificates"
-            )
+          if [ "$IS_YOUTUBE" = true ]; then
+            YTDLP_OPTS+=("--js-runtimes" "deno")
+            YTDLP_OPTS+=("--extractor-args" "youtube:player_client=android,ios,web,mweb,tv")
+          fi
 
-            if [ -f "cookies.txt" ]; then
-              echo "🍪 Using cookies.txt for authentication..."
-              opts+=("--cookiefile" "cookies.txt")
-            fi
-
-            # Deno JS runtime + extractor-args ONLY for YouTube
-            if [ "$IS_YOUTUBE" = true ]; then
-              opts+=("--js-runtimes" "deno")
-              opts+=("--extractor-args" "youtube:player_client=android,ios,web,mweb,tv")
-            fi
-
-            if [ "$use_proxy" = "warp" ]; then
-              opts+=("--proxy" "socks5://127.0.0.1:1080")
-            fi
-
-            YTDLP_OPTS=("${opts[@]}")
-          }
-
-          YDL_MODE_OPTS=()
+          # Handle media type specific options
+          MODE_OPTS=()
           case "$MEDIA_TYPE" in
             audio)
               echo "🎧 Mode: audio (MP3)"
-              FORMAT="bestaudio[abr<=192]/bestaudio[ext=m4a]/bestaudio/best"
-              YDL_MODE_OPTS=( "--extract-audio" "--audio-format" "mp3" "--audio-quality" "0" )
+              YTDLP_OPTS+=("--format" "bestaudio[abr<=192]/bestaudio[ext=m4a]/bestaudio/best")
+              MODE_OPTS=("--extract-audio" "--audio-format" "mp3" "--audio-quality" "0")
               ;;
             transcript)
               echo "📝 Mode: transcript (low bitrate audio + Whisper)"
-              FORMAT="bestaudio[abr<=64]/bestaudio[ext=m4a]/bestaudio/best"
-              YDL_MODE_OPTS=( "--extract-audio" "--audio-format" "mp3" "--audio-quality" "5" )
+              YTDLP_OPTS+=("--format" "bestaudio[abr<=64]/bestaudio[ext=m4a]/bestaudio/best")
+              MODE_OPTS=("--extract-audio" "--audio-format" "mp3" "--audio-quality" "5")
               ;;
             *)
               echo "🎬 Mode: video"
               ;;
           esac
 
-          echo "  🌐 Starting download..."
-          set +e
-          build_opts "warp"
-          yt-dlp "${YTDLP_OPTS[@]}" "${YDL_MODE_OPTS[@]}" "$URL" 2>"${SAVE_DIR}/logs/yt_error_warp.log"
-          EXIT_CODE=$?
-          if [ $EXIT_CODE -eq 0 ]; then
-            echo "  ✅ Downloaded via WARP"
-            DOWNLOAD_SUCCESS=true
-          else
-            echo "⚠️ WARP failed (exit $EXIT_CODE) — retrying without proxy..."
-            build_opts "none"
-            yt-dlp "${YTDLP_OPTS[@]}" "${YDL_MODE_OPTS[@]}" "$URL" 2>"${SAVE_DIR}/logs/yt_error_direct.log"
-            EXIT_CODE2=$?
-            if [ $EXIT_CODE2 -eq 0 ]; then
-              echo "  ✅ Downloaded via direct"
-              DOWNLOAD_SUCCESS=true
-            else
-              echo "❌ Direct also failed (exit $EXIT_CODE2)"
-              head -200 "${SAVE_DIR}/logs/yt_error_direct.log" || true
-              DOWNLOAD_SUCCESS=false
-            fi
-          fi
-          set -e
-
-          if [ "$DOWNLOAD_SUCCESS" = false ]; then
-            echo "  🚫 Download failed."
-            rm -rf "$TMP_DIR"
-            echo "DOWNLOAD_SUCCESS=false" >> $GITHUB_ENV
-            echo "DOWNLOAD_SUCCESS=false" >> $GITHUB_OUTPUT
-            exit 0
+          # Download with fallback
+          echo "🌐 Starting download..."
+          if ! yt-dlp --proxy "socks5://127.0.0.1:1080" "${YTDLP_OPTS[@]}" "${MODE_OPTS[@]}" "$URL" 2>"${SAVE_DIR}/logs/yt_error.log"; then
+            echo "⚠️ WARP failed, retrying without proxy..."
+            yt-dlp "${YTDLP_OPTS[@]}" "${MODE_OPTS[@]}" "$URL" 2>"${SAVE_DIR}/logs/yt_error_direct.log"
           fi
 
-          echo "DOWNLOAD_SUCCESS=true" >> $GITHUB_ENV
-          echo "DOWNLOAD_SUCCESS=true" >> $GITHUB_OUTPUT
-
-          # ═══ PROCESS & SAVE FILES ═══
+          # Process downloaded files
+          declare -a FILE_NAMES FILE_PATHS FILE_SIZES SPLIT_FLAGS
+          declare -a PART_NUMS TOTAL_PARTS_VALS ORIG_NAMES TRANSCRIPT_FLAGS
+          TOTAL_FILES=0
           AUDIO_FOR_TRANSCRIPT=""
-          FILE_INDEX=0
 
           for MEDIA_FILE in "$TMP_DIR"/*; do
             [ -f "$MEDIA_FILE" ] || continue
@@ -358,166 +227,157 @@ jobs:
             BASENAME=$(basename "$MEDIA_FILE")
             SAFE_NAME=$(sanitize_name "${BASENAME%.*}")
             EXT="${BASENAME##*.}"
-            FILE_SIZE=$(stat -c%s "$MEDIA_FILE" 2>/dev/null || echo 0)
-
-            echo "  📦 ${SAFE_NAME}.${EXT} — $(( FILE_SIZE / 1024 / 1024 ))MB"
+            FILE_SIZE=$(stat -c%s "$MEDIA_FILE")
 
             if [ "$MEDIA_TYPE" = "transcript" ]; then
-              echo "  🎧 Using this file as audio source for transcript."
               AUDIO_FOR_TRANSCRIPT="$MEDIA_FILE"
               continue
             fi
 
             if [ "$FILE_SIZE" -le "$TARGET_SIZE_BYTES" ]; then
+              # Single file
               cp "$MEDIA_FILE" "${SAVE_DIR}/${SAFE_NAME}.${EXT}"
-              echo "  💾 Saved: downloads/${EXTRACTOR_SLUG}/${SAFE_NAME}.${EXT}"
-              
-              # Track for JSON output
-              FILE_INDEX=$((FILE_INDEX + 1))
-              echo "FILE_${FILE_INDEX}_NAME=${SAFE_NAME}.${EXT}" >> $GITHUB_ENV
-              echo "FILE_${FILE_INDEX}_PATH=downloads/${EXTRACTOR_SLUG}/${SAFE_NAME}.${EXT}" >> $GITHUB_ENV
-              echo "FILE_${FILE_INDEX}_SIZE=${FILE_SIZE}" >> $GITHUB_ENV
-              echo "FILE_${FILE_INDEX}_SPLIT=false" >> $GITHUB_ENV
+              FILE_NAMES+=("${SAFE_NAME}.${EXT}")
+              FILE_PATHS+=("downloads/${EXTRACTOR_SLUG}/${SAFE_NAME}.${EXT}")
+              FILE_SIZES+=("$FILE_SIZE")
+              SPLIT_FLAGS+=("false")
+              TOTAL_FILES=$((TOTAL_FILES + 1))
             else
-              echo "  💾 >${TARGET_SIZE_MB}MB — splitting with RAR..."
+              # Split with RAR
+              echo "💾 Splitting ${SAFE_NAME}.${EXT} (${FILE_SIZE} bytes)..."
               SPLIT_DIR="/tmp/rar_split_$$"
               mkdir -p "$SPLIT_DIR"
               cp "$MEDIA_FILE" "${SPLIT_DIR}/${SAFE_NAME}.${EXT}"
               cd "$SPLIT_DIR"
               rar a -v${TARGET_SIZE_MB}m -ep1 -m0 -idq "${SAFE_NAME}.part.rar" "${SAFE_NAME}.${EXT}"
               rm -f "${SAFE_NAME}.${EXT}"
-              cd - > /dev/null
+              cd - >/dev/null
 
-              TOTAL_PARTS=$(ls "${SPLIT_DIR}/${SAFE_NAME}.part"*.rar 2>/dev/null | wc -l)
-              if [ "$TOTAL_PARTS" -gt "$MAX_PARTS" ]; then
-                echo "  ⚠️ Too many parts (${TOTAL_PARTS}) — skipping"
-                rm -rf "$SPLIT_DIR"
-                continue
+              PART_FILES=($(ls "${SPLIT_DIR}/${SAFE_NAME}.part"*.rar 2>/dev/null | sort))
+              TOTAL_PARTS=${#PART_FILES[@]}
+
+              if [ "$TOTAL_PARTS" -le "$MAX_PARTS" ]; then
+                for idx in "${!PART_FILES[@]}"; do
+                  PART_NUM=$((idx + 1))
+                  TARGET_NAME="${SAFE_NAME}.part${PART_NUM}.rar"
+                  cp "${PART_FILES[$idx]}" "${SAVE_DIR}/${TARGET_NAME}"
+                  FILE_NAMES+=("$TARGET_NAME")
+                  FILE_PATHS+=("downloads/${EXTRACTOR_SLUG}/${TARGET_NAME}")
+                  FILE_SIZES+=("$(stat -c%s "${SAVE_DIR}/${TARGET_NAME}")")
+                  SPLIT_FLAGS+=("true")
+                  PART_NUMS+=("$PART_NUM")
+                  TOTAL_PARTS_VALS+=("$TOTAL_PARTS")
+                  ORIG_NAMES+=("${SAFE_NAME}.${EXT}")
+                  TOTAL_FILES=$((TOTAL_FILES + 1))
+                done
+              else
+                echo "⚠️ Too many parts ($TOTAL_PARTS > $MAX_PARTS), skipping split"
               fi
-
-              echo "  📦 Split into ${TOTAL_PARTS} parts"
-              PART_INDEX=0
-              for PART_FILE in $(ls "${SPLIT_DIR}/${SAFE_NAME}.part"*.rar | sort); do
-                [ -f "$PART_FILE" ] || continue
-                PART_INDEX=$((PART_INDEX + 1))
-                TARGET_NAME="${SAFE_NAME}.part${PART_INDEX}.rar"
-                cp "$PART_FILE" "${SAVE_DIR}/${TARGET_NAME}"
-                echo "    💾 Part ${PART_INDEX}/${TOTAL_PARTS} → downloads/${EXTRACTOR_SLUG}/${TARGET_NAME}"
-                
-                # Track for JSON output
-                FILE_INDEX=$((FILE_INDEX + 1))
-                echo "FILE_${FILE_INDEX}_NAME=${TARGET_NAME}" >> $GITHUB_ENV
-                echo "FILE_${FILE_INDEX}_PATH=downloads/${EXTRACTOR_SLUG}/${TARGET_NAME}" >> $GITHUB_ENV
-                echo "FILE_${FILE_INDEX}_SIZE=$(stat -c%s "${SAVE_DIR}/${TARGET_NAME}" 2>/dev/null || echo 0)" >> $GITHUB_ENV
-                echo "FILE_${FILE_INDEX}_SPLIT=true" >> $GITHUB_ENV
-                echo "FILE_${FILE_INDEX}_PART=${PART_INDEX}" >> $GITHUB_ENV
-                echo "FILE_${FILE_INDEX}_TOTAL_PARTS=${TOTAL_PARTS}" >> $GITHUB_ENV
-                echo "FILE_${FILE_INDEX}_ORIGINAL_NAME=${SAFE_NAME}.${EXT}" >> $GITHUB_ENV
-              done
               rm -rf "$SPLIT_DIR"
             fi
           done
 
-          echo "TOTAL_FILES=${FILE_INDEX}" >> $GITHUB_ENV
-          echo "TOTAL_FILES=${FILE_INDEX}" >> $GITHUB_OUTPUT
+          # Whisper transcription
+          if [ "$MEDIA_TYPE" = "transcript" ] && [ -n "$AUDIO_FOR_TRANSCRIPT" ] && [ -f "$AUDIO_FOR_TRANSCRIPT" ]; then
+            echo "🎧 Generating transcript with Whisper..."
+            TRANSCRIPT_FILE="${TMP_DIR}/transcript.txt"
+            python3 - <<PYTHON
+from faster_whisper import WhisperModel
+import os
 
-          # ═══ WHISPER TRANSCRIPT ═══
-          if [ "$MEDIA_TYPE" = "transcript" ] && [ -n "$AUDIO_FOR_TRANSCRIPT" ]; then
-            echo "🎧 Preparing Whisper transcription..."
-            TRANSCRIPT_FILE="${TMP_DIR}/$(sanitize_name "$TITLE")_transcript.txt"
-            export AUDIO_FOR_TRANSCRIPT TRANSCRIPT_FILE DURATION
+audio = "$AUDIO_FOR_TRANSCRIPT"
+model = WhisperModel("base", device="cpu", compute_type="int8", cpu_threads=2)
+segments, _ = model.transcribe(audio, beam_size=5)
 
-            if [ ! -s "$AUDIO_FOR_TRANSCRIPT" ]; then
-              echo "❌ Audio file for transcript missing or empty: $AUDIO_FOR_TRANSCRIPT"
-            else
-              WHISPER_PY="${TMP_DIR}/whisper_run.py"
-              printf 'import os\nfrom faster_whisper import WhisperModel\n\naudio_path = os.environ.get("AUDIO_FOR_TRANSCRIPT")\nout_path = os.environ.get("TRANSCRIPT_FILE")\nduration = float(os.environ.get("DURATION") or 0)\n\nprint(f"[Whisper] Audio: {audio_path}")\nprint(f"[Whisper] Output: {out_path}")\nprint(f"[Whisper] Duration: {duration}")\n\nmodel = WhisperModel("base", device="cpu", compute_type="int8", cpu_threads=2)\n\nsegments, _ = model.transcribe(audio_path, beam_size=5, vad_filter=False)\n\nwith open(out_path, "w", encoding="utf-8") as f:\n    for seg in segments:\n        text = seg.text.strip()\n        if not text:\n            continue\n        timestamp = f"[{int(seg.start // 60):02d}:{int(seg.start %% 60):02d}] "\n        f.write(timestamp + text + "\\n")\n        if text.endswith((".", "!", "?")):\n            f.write("\\n")\n\nprint("[Whisper] Transcript completed.")\n' > "${WHISPER_PY}"
+with open("$TRANSCRIPT_FILE", "w", encoding="utf-8") as f:
+    for seg in segments:
+        text = seg.text.strip()
+        if text:
+            ts = f"[{int(seg.start//60):02d}:{int(seg.start%60):02d}]"
+            f.write(f"{ts} {text}\n")
+            if text.endswith(('.', '!', '?')):
+                f.write("\n")
+print("✅ Transcript generated")
+PYTHON
 
-              python3 "${WHISPER_PY}" 2>"${SAVE_DIR}/logs/whisper_error.log" || echo "❌ Whisper failed (see logs/whisper_error.log)"
-              rm -f "${WHISPER_PY}"
-
-              if [ -f "$TRANSCRIPT_FILE" ]; then
-                SAFE_TNAME=$(sanitize_name "${TITLE}_transcript")
-                cp "$TRANSCRIPT_FILE" "${SAVE_DIR}/${SAFE_TNAME}.txt"
-                echo "💾 Transcript saved: downloads/${EXTRACTOR_SLUG}/${SAFE_TNAME}.txt"
-                
-                FILE_INDEX=$((FILE_INDEX + 1))
-                echo "FILE_${FILE_INDEX}_NAME=${SAFE_TNAME}.txt" >> $GITHUB_ENV
-                echo "FILE_${FILE_INDEX}_PATH=downloads/${EXTRACTOR_SLUG}/${SAFE_TNAME}.txt" >> $GITHUB_ENV
-                echo "FILE_${FILE_INDEX}_SIZE=$(stat -c%s "${SAVE_DIR}/${SAFE_TNAME}.txt" 2>/dev/null || echo 0)" >> $GITHUB_ENV
-                echo "FILE_${FILE_INDEX}_SPLIT=false" >> $GITHUB_ENV
-                echo "FILE_${FILE_INDEX}_IS_TRANSCRIPT=true" >> $GITHUB_ENV
-                echo "TOTAL_FILES=${FILE_INDEX}" >> $GITHUB_ENV
-                echo "TOTAL_FILES=${FILE_INDEX}" >> $GITHUB_OUTPUT
-              else
-                echo "⚠️ Whisper did not produce a transcript file."
-              fi
+            if [ -f "$TRANSCRIPT_FILE" ]; then
+              SAFE_TNAME=$(sanitize_name "${TITLE}_transcript")
+              cp "$TRANSCRIPT_FILE" "${SAVE_DIR}/${SAFE_TNAME}.txt"
+              FILE_NAMES+=("${SAFE_TNAME}.txt")
+              FILE_PATHS+=("downloads/${EXTRACTOR_SLUG}/${SAFE_TNAME}.txt")
+              FILE_SIZES+=("$(stat -c%s "${SAVE_DIR}/${SAFE_TNAME}.txt")")
+              SPLIT_FLAGS+=("false")
+              TRANSCRIPT_FLAGS+=("true")
+              TOTAL_FILES=$((TOTAL_FILES + 1))
             fi
           fi
 
-          # ═══ CLEANUP ═══
+          # Cleanup
           rm -rf "$TMP_DIR"
-          
-          # Metadata outputs
-          echo "CREATOR=${CREATOR}" >> $GITHUB_ENV
-          echo "TITLE=${TITLE}" >> $GITHUB_ENV
-          echo "EXTRACTOR=${EXTRACTOR}" >> $GITHUB_ENV
-          echo "EXTRACTOR_SLUG=${EXTRACTOR_SLUG}" >> $GITHUB_ENV
-          echo "DURATION=${DURATION}" >> $GITHUB_ENV
-          echo "THUMBNAIL_URL=${THUMBNAIL_URL}" >> $GITHUB_ENV
-          echo "VIEW_COUNT=${VIEW_COUNT}" >> $GITHUB_ENV
-          
-          echo "CREATOR=${CREATOR}" >> $GITHUB_OUTPUT
-          echo "TITLE=${TITLE}" >> $GITHUB_OUTPUT
-          echo "EXTRACTOR=${EXTRACTOR}" >> $GITHUB_OUTPUT
-          echo "EXTRACTOR_SLUG=${EXTRACTOR_SLUG}" >> $GITHUB_OUTPUT
-          echo "DURATION=${DURATION}" >> $GITHUB_OUTPUT
-          echo "VIEW_COUNT=${VIEW_COUNT}" >> $GITHUB_OUTPUT
-          
-          echo "✅ Download & Process Complete"
 
-      # ═══════════════════════════════════════
-      # STEP 7: Commit Files to Repository
-      # ═══════════════════════════════════════
+          # Save all outputs for next steps
+          {
+            echo "download_success=true"
+            echo "total_files=${TOTAL_FILES}"
+            echo "extractor_slug=${EXTRACTOR_SLUG}"
+            echo "creator=${CREATOR}"
+            echo "title=${TITLE}"
+            echo "extractor=${EXTRACTOR}"
+            echo "duration=${DURATION}"
+            echo "view_count=${VIEW_COUNT}"
+            echo "thumbnail_url=${THUMBNAIL_URL}"
+            
+            # Serialize arrays (max 50 files)
+            for i in "${!FILE_NAMES[@]}"; do
+              echo "file_${i}_name=${FILE_NAMES[$i]}"
+              echo "file_${i}_path=${FILE_PATHS[$i]}"
+              echo "file_${i}_size=${FILE_SIZES[$i]}"
+              echo "file_${i}_split=${SPLIT_FLAGS[$i]}"
+              if [ "${SPLIT_FLAGS[$i]}" = "true" ]; then
+                echo "file_${i}_part=${PART_NUMS[$i]}"
+                echo "file_${i}_total_parts=${TOTAL_PARTS_VALS[$i]}"
+                echo "file_${i}_original_name=${ORIG_NAMES[$i]}"
+              fi
+              if [ "${TRANSCRIPT_FLAGS[$i]:-false}" = "true" ]; then
+                echo "file_${i}_is_transcript=true"
+              fi
+            done
+          } >> $GITHUB_OUTPUT
+
       - name: "📤 Commit Downloads to Repository"
-        if: env.DOWNLOAD_SUCCESS == 'true'
+        if: steps.download.outputs.download_success == 'true'
         run: |
           cd "$GITHUB_WORKSPACE"
           git add downloads/
           if git diff --staged --quiet; then
             echo "🟢 No changes to commit"
           else
-            echo "📤 Committing and pushing changes..."
-            git commit -m "feat: add ${{ env.TITLE }} [${{ env.EXTRACTOR }}]" --quiet
-            git pull --rebase origin main || true
-            git push origin main --force-with-lease 2>&1
-            echo "✅ Pushed to repo"
+            git commit -m "feat: add ${{ steps.download.outputs.title }} [${{ steps.download.outputs.extractor }}]"
+            git pull --rebase origin main --quiet || true
+            git push origin main --force-with-lease --quiet
+            echo "✅ Pushed to repository"
           fi
 
-      # ═══════════════════════════════════════
-      # STEP 8: Generate Output JSON for Bot
-      # ═══════════════════════════════════════
-      - name: "📋 Generate Output JSON"
-        if: env.DOWNLOAD_SUCCESS == 'true'
+      - name: "📋 Generate Output JSON for Bot"
         id: output_json
+        if: steps.download.outputs.download_success == 'true'
         run: |
-          TOTAL=${{ env.TOTAL_FILES }}
-          
-          # Build JSON array of files
+          TOTAL=${{ steps.download.outputs.total_files }}
           FILES_JSON="["
-          for i in $(seq 1 $TOTAL); do
-            NAME_VAR="FILE_${i}_NAME"
-            PATH_VAR="FILE_${i}_PATH"
-            SIZE_VAR="FILE_${i}_SIZE"
-            SPLIT_VAR="FILE_${i}_SPLIT"
-            PART_VAR="FILE_${i}_PART"
-            TOTAL_PARTS_VAR="FILE_${i}_TOTAL_PARTS"
-            ORIG_VAR="FILE_${i}_ORIGINAL_NAME"
-            TRANSCRIPT_VAR="FILE_${i}_IS_TRANSCRIPT"
-            
-            if [ $i -gt 1 ]; then
+          
+          for i in $(seq 0 $((TOTAL - 1))); do
+            if [ $i -gt 0 ]; then
               FILES_JSON+=","
             fi
+            
+            NAME_VAR="file_${i}_name"
+            PATH_VAR="file_${i}_path"
+            SIZE_VAR="file_${i}_size"
+            SPLIT_VAR="file_${i}_split"
+            PART_VAR="file_${i}_part"
+            TOTAL_PARTS_VAR="file_${i}_total_parts"
+            ORIG_VAR="file_${i}_original_name"
+            TRANS_VAR="file_${i}_is_transcript"
             
             FILES_JSON+="{\"name\":\"${!NAME_VAR}\",\"path\":\"${!PATH_VAR}\",\"size\":${!SIZE_VAR},\"split\":${!SPLIT_VAR:-false}"
             
@@ -525,7 +385,7 @@ jobs:
               FILES_JSON+=",\"part\":${!PART_VAR},\"total_parts\":${!TOTAL_PARTS_VAR},\"original_name\":\"${!ORIG_VAR}\""
             fi
             
-            if [ "${!TRANSCRIPT_VAR:-false}" = "true" ]; then
+            if [ "${!TRANS_VAR:-false}" = "true" ]; then
               FILES_JSON+=",\"is_transcript\":true"
             fi
             
@@ -533,26 +393,20 @@ jobs:
           done
           FILES_JSON+="]"
           
-          echo "FILES_JSON=${FILES_JSON}" >> $GITHUB_OUTPUT
+          echo "json_output=${FILES_JSON}" >> $GITHUB_OUTPUT
           
-          # Print summary for logs
           echo "════════════════════════════════════════"
           echo "  📋 OUTPUT SUMMARY"
           echo "════════════════════════════════════════"
-          echo "  🏷 Extractor: ${{ env.EXTRACTOR }}"
-          echo "  👤 Creator:   ${{ env.CREATOR }}"
-          echo "  📝 Title:     ${{ env.TITLE }}"
-          echo "  ⏱ Duration:  ${{ env.DURATION }}s"
-          echo "  📦 Files:     ${{ env.TOTAL_FILES }}"
+          echo "  🏷 Extractor: ${{ steps.download.outputs.extractor }}"
+          echo "  👤 Creator:   ${{ steps.download.outputs.creator }}"
+          echo "  📝 Title:     ${{ steps.download.outputs.title }}"
+          echo "  ⏱ Duration:  ${{ steps.download.outputs.duration }}s"
+          echo "  📦 Files:     ${{ steps.download.outputs.total_files }}"
           echo "════════════════════════════════════════"
 
-      # ═══════════════════════════════════════
-      # STEP 9: Stop WARP
-      # ═══════════════════════════════════════
       - name: "🛑 Stop WARP"
         if: always()
         run: |
-          echo "🛑 Stopping WARP container..."
           docker stop warp 2>/dev/null || true
           docker rm warp 2>/dev/null || true
-          echo "✅ WARP stopped and removed."
